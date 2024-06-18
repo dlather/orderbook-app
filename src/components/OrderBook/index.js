@@ -1,44 +1,63 @@
 import { Centrifuge } from "centrifuge";
 import { useEffect, useState, useRef } from "react";
+import { orderBookChannel, orderBookSymbol } from "../../constants";
 
 const OrderBook = () => {
   const [bids, setBids] = useState([]);
   const [asks, setAsks] = useState([]);
-  const [centrifuge, setcentrifuge] = useState(null);
-  const [subscription, setsubscription] = useState(null);
+  const centrifugeRef = useRef(null);
+  const subscriptionRef = useRef(null);
   const lastSequence = useRef(0);
   const isReconnecting = useRef(false);
+  const [reconnectionAttempts, setReconnectionAttempts] = useState(0);
 
   useEffect(() => {
     const centri = new Centrifuge("wss://api.prod.rabbitx.io/ws", {
+      // debug: true,
       token:
         "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiI0MDAwMDAwMDAwIiwiZXhwIjo2NTQ4NDg3NTY5fQ.o_qBZltZdDHBH3zHPQkcRhVBQCtejIuyq8V1yj5kYq8",
       // "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIwIiwiZXhwIjo1MjYyNjUyMDEwfQ.x_245iYDEvTTbraw1gt4jmFRFfgMJb-GJ-hsU9HuDik",
     });
+    centrifugeRef.current = centri;
+
+    centri
+      .on("connecting", function (ctx) {
+        console.log(`connecting: ${ctx.code}, ${ctx.reason}`);
+      })
+      .on("connected", handleConnect)
+      .on("disconnected", handleDisconnect)
+      .connect();
 
     // Chennel to be used: orderbook:<symbol> => orderbook:BTC-USD
-    const sub = centri.newSubscription("orderbook:BTC-USD");
+    const sub = centri.newSubscription(orderBookChannel);
+    subscriptionRef.current = sub;
 
-    sub.on("publication", handleOrderbookUpdate);
-    centri.on("connected", handleConnect);
-    centri.on("disconnected", handleDisconnect);
-
-    sub.subscribe("orderbook:BTC-USD");
-    centri.connect();
-
-    setcentrifuge(centri);
-    setsubscription(sub);
+    sub
+      .on("publication", handleOrderbookUpdate)
+      .on("subscribing", function (ctx) {
+        console.log(`subscribing: ${ctx.code}, ${ctx.reason}`);
+      })
+      .on("subscribed", function (ctx) {
+        console.log(`subscribed: ${ctx.channel}`);
+        setBids(ctx.data?.bids ?? []);
+        setAsks(ctx.data?.asks ?? []);
+        lastSequence.current = ctx.data.sequence ?? 0;
+      })
+      .on("unsubscribed", function (ctx) {
+        console.log(`unsubscribed: ${ctx.code}, ${ctx.reason}`);
+      })
+      .subscribe();
 
     return () => {
       centri.disconnect();
+      sub.unsubscribe();
     };
   }, []);
 
   const handleConnect = () => {
     console.log("Connected to websocket");
     isReconnecting.current = false;
-    lastSequence.current = 0;
-    subscription.subscribe("orderbook:BTC-USD");
+    setReconnectionAttempts(0);
   };
 
   const handleDisconnect = (context) => {
@@ -50,19 +69,46 @@ const OrderBook = () => {
   };
 
   const attemptReconnection = () => {
+    const delay = Math.min(1000 * 2 ** reconnectionAttempts, 30000); // Exponential backoff with a max delay of 30 seconds
     setTimeout(() => {
       if (isReconnecting.current) {
-        console.log("Attempting to reconnect...");
-        centrifuge.connect();
-        subscription.subscribe("orderbook:BTC-USD");
+        console.log(
+          `Attempting to reconnect... (Attempt ${reconnectionAttempts + 1})`
+        );
+        setReconnectionAttempts((prev) => prev + 1);
+        centrifugeRef.current.connect();
+        subscriptionRef.current.subscribe();
       }
-    }, 5000); // Attempt to reconnect every 5 seconds
+    }, delay);
+  };
+
+  const fetchSnapshot = async () => {
+    console.log("fetching snapshot");
+    try {
+      const response = await fetch(
+        `https://api.prod.rabbitx.io/markets/orderbook?market_id=${orderBookSymbol}&p_limit=100&p_page=0&p_order=DESC`
+      );
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
+      const data = await response.json();
+      setBids(data.bids ?? []);
+      setAsks(data.asks ?? []);
+      lastSequence.current = data.sequence;
+    } catch (error) {
+      console.error("Error fetching initial snapshot:", error);
+    }
   };
 
   const handleOrderbookUpdate = (message) => {
     const data = message.data;
     if (data.sequence <= lastSequence.current) {
       console.warn("Out of order sequence number, skipping update");
+      return;
+    }
+    if (data.sequence !== lastSequence.current + 1) {
+      console.warn("Missed sequence number, fetching snapshot");
+      fetchSnapshot();
       return;
     }
     lastSequence.current = data.sequence;
@@ -72,7 +118,6 @@ const OrderBook = () => {
   };
 
   const mergeOrders = (currentOrders, newOrders, type) => {
-    console.log(newOrders);
     const orderMap = new Map(
       currentOrders.map((order) => [order[0], order[1]])
     );
@@ -91,7 +136,6 @@ const OrderBook = () => {
 
     return type === "bids" ? mergedOrders.reverse() : mergedOrders;
   };
-  console.log(asks.length > bids.length ? asks.length : bids.length);
   return (
     <div className="overflow-x-auto">
       <table className="table">
@@ -121,7 +165,9 @@ const OrderBook = () => {
               );
             })
           ) : (
-            <div>Empty</div>
+            <tr>
+              <td>No Date Found</td>
+            </tr>
           )}
         </tbody>
       </table>
