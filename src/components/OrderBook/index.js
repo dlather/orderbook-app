@@ -5,6 +5,8 @@ import { orderBookChannel, orderBookSymbol } from "../../constants";
 const OrderBook = () => {
   const [bids, setBids] = useState([]);
   const [asks, setAsks] = useState([]);
+  const [maxAskSize, setmaxAskSize] = useState(0);
+  const [maxBidSize, setmaxBidSize] = useState(0);
   const centrifugeRef = useRef(null);
   const subscriptionRef = useRef(null);
   const lastSequence = useRef(0);
@@ -39,8 +41,12 @@ const OrderBook = () => {
       })
       .on("subscribed", function (ctx) {
         console.log(`subscribed: ${ctx.channel}`);
-        setBids(ctx.data?.bids ?? []);
+        console.log(ctx);
+        // sort bids
+        setBids((ctx.data?.bids ?? []).sort((a, b) => b[0] - a[0]));
+        setmaxBidSize(findMax(ctx.data?.bids ?? []));
         setAsks(ctx.data?.asks ?? []);
+        setmaxAskSize(findMax(ctx.data?.asks ?? []));
         lastSequence.current = ctx.data.sequence ?? 0;
       })
       .on("unsubscribed", function (ctx) {
@@ -82,6 +88,16 @@ const OrderBook = () => {
     }, delay);
   };
 
+  const findMax = (pairs) => {
+    return pairs.length > 0
+      ? pairs.reduce(
+          (max, current) =>
+            parseFloat(current[1]) > max ? parseFloat(current[1]) : max,
+          parseFloat(pairs[0][1])
+        )
+      : 0;
+  };
+
   const fetchSnapshot = async () => {
     console.log("fetching snapshot");
     try {
@@ -93,7 +109,9 @@ const OrderBook = () => {
       }
       const data = await response.json();
       setBids(data.bids ?? []);
+      setmaxBidSize(findMax(data?.bids ?? []));
       setAsks(data.asks ?? []);
+      setmaxAskSize(findMax(data?.asks ?? []));
       lastSequence.current = data.sequence;
     } catch (error) {
       console.error("Error fetching initial snapshot:", error);
@@ -113,54 +131,87 @@ const OrderBook = () => {
     }
     lastSequence.current = data.sequence;
 
-    setBids((prevBids) => mergeOrders(prevBids, data.bids, "bids"));
-    setAsks((prevAsks) => mergeOrders(prevAsks, data.asks, "asks"));
+    setBids((prevBids) => mergeOrders(prevBids, data.bids, "bid"));
+    setAsks((prevAsks) => mergeOrders(prevAsks, data.asks, "ask"));
   };
 
-  const mergeOrders = (currentOrders, newOrders, type) => {
-    const orderMap = new Map(
-      currentOrders.map((order) => [order[0], order[1]])
-    );
-
-    (newOrders ?? []).forEach((order) => {
-      if (parseFloat(order[1]) === 0) {
-        orderMap.delete(order[0]);
-      } else {
-        orderMap.set(order[0], order[1]);
+  const mergeOrders = (side, updates, orderType) => {
+    // TODO: do we need to copy
+    const updatedSide = [...side];
+    updates.forEach(([price, quantity]) => {
+      const index = updatedSide.findIndex(
+        (order) => parseFloat(order[0]) === parseFloat(price)
+      );
+      const updatedSizeOldQuant = index === -1 ? null : updatedSide[index][1];
+      if (index !== -1) {
+        if (parseFloat(quantity) === 0) {
+          updatedSide.splice(index, 1);
+        } else {
+          updatedSide[index][1] = quantity;
+        }
+      } else if (parseFloat(quantity) !== 0) {
+        updatedSide.push([price, quantity]);
+        updatedSide.sort((a, b) =>
+          orderType === "bid"
+            ? parseFloat(b[0]) - parseFloat(a[0])
+            : parseFloat(a[0]) - parseFloat(b[0])
+        );
+      }
+      if (updatedSizeOldQuant && updatedSizeOldQuant === parseFloat(quantity)) {
+        orderType === "bid"
+          ? setmaxBidSize(findMax(updatedSide))
+          : setmaxAskSize(findMax(updatedSide));
       }
     });
-
-    const mergedOrders = Array.from(orderMap.entries())
-      .map(([price, quantity]) => [price, quantity])
-      .sort((a, b) => parseFloat(a[0]) - parseFloat(b[0]));
-
-    return type === "bids" ? mergedOrders.reverse() : mergedOrders;
+    return updatedSide;
   };
   return (
     <div className="overflow-x-auto">
-      <table className="table">
+      <table className="table p-4">
         <thead>
           <tr>
-            <th>Bids</th>
-            <th></th>
-            <th>Asks</th>
-          </tr>
-          <tr>
-            <th>Size</th>
-            <th>Price</th>
-            <th>Prize</th>
-            <th>Size</th>
+            <th>{orderBookSymbol}</th>
           </tr>
         </thead>
         <tbody>
           {asks.length > 0 || bids.length > 0 ? (
             [...Array(Math.max(asks.length, bids.length))].map((emp, i) => {
               return (
-                <tr key={i}>
-                  <td>{i < bids.length ? bids[i][1] : null}</td>
-                  <td>{i < bids.length ? bids[i][0] : null}</td>
-                  <td>{i < asks.length ? asks[i][0] : null}</td>
-                  <td>{i < asks.length ? asks[i][1] : null}</td>
+                <tr key={i} className="grid grid-cols-2 gap-2">
+                  <td className="bg-green-100 flex justify-between items-center">
+                    <div className="flex justify-center items-center">
+                      {i < bids.length ? (
+                        <progress
+                          className="progress progress-success w-56 mx-2"
+                          value={bids.length ? bids[i][1] : 0}
+                          max={maxBidSize}
+                        ></progress>
+                      ) : null}
+                      <p className="text-gray-400 w-20">
+                        {i < bids.length ? bids[i][1] : null}
+                      </p>
+                    </div>
+                    <p className="font-bold text-green-800">
+                      {i < bids.length ? bids[i][0] : null}
+                    </p>
+                  </td>
+                  <td className="bg-red-100 flex justify-between items-center">
+                    <p className="font-bold text-red-800">
+                      {i < asks.length ? asks[i][0] : null}
+                    </p>
+                    <div className="flex justify-center items-center">
+                      {i < asks.length ? (
+                        <progress
+                          className="progress progress-error w-72 mx-2"
+                          value={asks.length ? asks[i][1] : 0}
+                          max={maxAskSize}
+                        ></progress>
+                      ) : null}
+                      <p className="text-gray-400 w-20">
+                        {i < asks.length ? asks[i][1] : null}
+                      </p>
+                    </div>
+                  </td>
                 </tr>
               );
             })
