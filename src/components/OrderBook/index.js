@@ -3,15 +3,15 @@ import { useEffect, useState, useRef } from "react";
 import { orderBookChannel, orderBookSymbol } from "../../constants";
 
 const OrderBook = () => {
-  const [bids, setBids] = useState([]);
-  const [asks, setAsks] = useState([]);
+  const [bids, setBids] = useState([]); // desending order
+  const [asks, setAsks] = useState([]); // asending order
   const [maxAskSize, setmaxAskSize] = useState(0);
   const [maxBidSize, setmaxBidSize] = useState(0);
   const centrifugeRef = useRef(null);
-  const subscriptionRef = useRef(null);
   const lastSequence = useRef(0);
-  const isReconnecting = useRef(false);
-  const [reconnectionAttempts, setReconnectionAttempts] = useState(0);
+  const isFecthingSnapshot = useRef(false);
+  const messageBuffer = useRef([]);
+  const abortControllerRef = useRef(null);
 
   useEffect(() => {
     const centri = new Centrifuge("wss://api.prod.rabbitx.io/ws", {
@@ -26,29 +26,21 @@ const OrderBook = () => {
       .on("connecting", function (ctx) {
         console.log(`connecting: ${ctx.code}, ${ctx.reason}`);
       })
-      .on("connected", handleConnect)
+      .on("connected", function (ctx) {
+        console.log(`connected over ${ctx.transport}`);
+      })
       .on("disconnected", handleDisconnect)
       .connect();
 
-    // Chennel to be used: orderbook:<symbol> => orderbook:BTC-USD
+    // Channel to be used: orderbook:<symbol> => orderbook:BTC-USD
     const sub = centri.newSubscription(orderBookChannel);
-    subscriptionRef.current = sub;
 
     sub
-      .on("publication", handleOrderbookUpdate)
+      .on("publication", handlePublication)
       .on("subscribing", function (ctx) {
         console.log(`subscribing: ${ctx.code}, ${ctx.reason}`);
       })
-      .on("subscribed", function (ctx) {
-        console.log(`subscribed: ${ctx.channel}`);
-        console.log(ctx);
-        // sort bids
-        setBids((ctx.data?.bids ?? []).sort((a, b) => b[0] - a[0]));
-        setmaxBidSize(findMax(ctx.data?.bids ?? []));
-        setAsks(ctx.data?.asks ?? []);
-        setmaxAskSize(findMax(ctx.data?.asks ?? []));
-        lastSequence.current = ctx.data.sequence ?? 0;
-      })
+      .on("subscribed", handleSubscribed)
       .on("unsubscribed", function (ctx) {
         console.log(`unsubscribed: ${ctx.code}, ${ctx.reason}`);
       })
@@ -60,35 +52,17 @@ const OrderBook = () => {
     };
   }, []);
 
-  const handleConnect = () => {
-    console.log("Connected to websocket");
-    isReconnecting.current = false;
-    setReconnectionAttempts(0);
+  const handleSubscribed = (ctx) => {
+    console.log(`subscribed: ${ctx.channel}`);
+    // asks and bids are sorted in asending by default
+    setBids((ctx.data?.bids ?? []).reverse());
+    setmaxBidSize(findMaxSize(ctx.data?.bids ?? []));
+    setmaxAskSize(findMaxSize(ctx.data?.asks ?? []));
+    setAsks(ctx.data?.asks ?? []);
+    lastSequence.current = ctx.data.sequence ?? 0;
   };
 
-  const handleDisconnect = (context) => {
-    console.log("Disconnected from websocket:", context);
-    if (!isReconnecting.current) {
-      isReconnecting.current = true;
-      attemptReconnection();
-    }
-  };
-
-  const attemptReconnection = () => {
-    const delay = Math.min(1000 * 2 ** reconnectionAttempts, 30000); // Exponential backoff with a max delay of 30 seconds
-    setTimeout(() => {
-      if (isReconnecting.current) {
-        console.log(
-          `Attempting to reconnect... (Attempt ${reconnectionAttempts + 1})`
-        );
-        setReconnectionAttempts((prev) => prev + 1);
-        centrifugeRef.current.connect();
-        subscriptionRef.current.subscribe();
-      }
-    }, delay);
-  };
-
-  const findMax = (pairs) => {
+  const findMaxSize = (pairs) => {
     return pairs.length > 0
       ? pairs.reduce(
           (max, current) =>
@@ -98,41 +72,122 @@ const OrderBook = () => {
       : 0;
   };
 
+  const handleDisconnect = (context) => {
+    console.log("Disconnected from websocket:", context);
+    // connect() client will tries to reestablish connection periodically
+    centrifugeRef.current.connect();
+  };
+
+  const processBufferedMessages = (data) => {
+    console.log(
+      `processBufferedMessages: ${JSON.stringify(messageBuffer.current)}`
+    );
+    lastSequence.current = data.sequence;
+    const unprocessedBids = [];
+    const unprocessedAsks = [];
+    (messageBuffer.current ?? [])
+      .filter((mess) => mess.sequence >= data.sequence)
+      .forEach((message) => {
+        if (message.sequence === lastSequence.current + 1) {
+          lastSequence.current = message.sequence;
+          unprocessedBids.push(message.bids);
+          unprocessedAsks.push(message.asks);
+        } else {
+          console.log(
+            "calling resynchronize as message buffer sequence is missed"
+          );
+          // resynchronize();
+          return;
+        }
+      });
+
+    let bidsData = (data.bids ?? []).reverse();
+    let asksData = data.asks ?? [];
+    unprocessedBids.forEach((unprocessedBid) => {
+      bidsData = mergeOrders(bidsData, unprocessedBid, "bid");
+    });
+    unprocessedAsks.forEach((unprocessedAsk) => {
+      bidsData = mergeOrders(asksData, unprocessedAsk, "ask");
+    });
+    setmaxBidSize(findMaxSize(bidsData) ?? []);
+    setBids(bidsData);
+    setmaxAskSize(findMaxSize(bidsData ?? []));
+    setAsks(asksData);
+    messageBuffer.current = [];
+  };
+
+  const resynchronize = () => {
+    messageBuffer.current = [];
+    abortControllerRef.current.abort();
+    fetchSnapshot();
+  };
+
   const fetchSnapshot = async () => {
     console.log("fetching snapshot");
+    isFecthingSnapshot.current = true;
     try {
+      const controller = new AbortController();
+      abortControllerRef.current = controller;
+      const signal = controller.signal;
+      // API returns bids and asks in asc order
       const response = await fetch(
-        `https://api.prod.rabbitx.io/markets/orderbook?market_id=${orderBookSymbol}&p_limit=100&p_page=0&p_order=DESC`
+        `https://api.prod.rabbitx.io/markets/orderbook?market_id=${orderBookSymbol}&p_limit=100&p_page=0&p_order=ASC`,
+        { signal }
       );
       if (!response.ok) {
         throw new Error(`HTTP error! status: ${response.status}`);
       }
       const data = await response.json();
-      setBids(data.bids ?? []);
-      setmaxBidSize(findMax(data?.bids ?? []));
-      setAsks(data.asks ?? []);
-      setmaxAskSize(findMax(data?.asks ?? []));
-      lastSequence.current = data.sequence;
+      console.log(`Response from Snapshot: ${JSON.stringify(data)}`);
+      processBufferedMessages(data);
     } catch (error) {
-      console.error("Error fetching initial snapshot:", error);
+      console.error("Error fetching snapshot:", error);
+    } finally {
+      isFecthingSnapshot.current = false;
+      abortControllerRef.current = null;
     }
   };
 
-  const handleOrderbookUpdate = (message) => {
+  const handlePublication = (message) => {
     const data = message.data;
+    console.log(data.sequence);
+    if (data.sequence % 200 === 0) {
+      return;
+    }
+    if (isFecthingSnapshot.current) {
+      console.log("Waiting for snapshot");
+      messageBuffer.current.push(data);
+      console.log(messageBuffer);
+      return;
+    }
+
+    if (
+      !isFecthingSnapshot.current &&
+      data.sequence !== lastSequence.current + 1
+    ) {
+      console.warn("Missed sequence number, fetching snapshot");
+      messageBuffer.current = [];
+      messageBuffer.current.push(data);
+      console.log(messageBuffer);
+      fetchSnapshot();
+      return;
+    }
     if (data.sequence <= lastSequence.current) {
       console.warn("Out of order sequence number, skipping update");
       return;
     }
-    if (data.sequence !== lastSequence.current + 1) {
-      console.warn("Missed sequence number, fetching snapshot");
-      fetchSnapshot();
-      return;
-    }
-    lastSequence.current = data.sequence;
 
-    setBids((prevBids) => mergeOrders(prevBids, data.bids, "bid"));
-    setAsks((prevAsks) => mergeOrders(prevAsks, data.asks, "ask"));
+    lastSequence.current = data.sequence;
+    setBids((prevBids) => {
+      const updatedBids = mergeOrders(prevBids, data.bids, "bid");
+      setmaxBidSize(findMaxSize(updatedBids ?? []));
+      return updatedBids;
+    });
+    setAsks((prevAsks) => {
+      const updatedAsks = mergeOrders(prevAsks, data.asks, "ask");
+      setmaxAskSize(findMaxSize(updatedAsks ?? []));
+      return updatedAsks;
+    });
   };
 
   const mergeOrders = (side, updates, orderType) => {
@@ -142,7 +197,6 @@ const OrderBook = () => {
       const index = updatedSide.findIndex(
         (order) => parseFloat(order[0]) === parseFloat(price)
       );
-      const updatedSizeOldQuant = index === -1 ? null : updatedSide[index][1];
       if (index !== -1) {
         if (parseFloat(quantity) === 0) {
           updatedSide.splice(index, 1);
@@ -156,11 +210,6 @@ const OrderBook = () => {
             ? parseFloat(b[0]) - parseFloat(a[0])
             : parseFloat(a[0]) - parseFloat(b[0])
         );
-      }
-      if (updatedSizeOldQuant && updatedSizeOldQuant === parseFloat(quantity)) {
-        orderType === "bid"
-          ? setmaxBidSize(findMax(updatedSide))
-          : setmaxAskSize(findMax(updatedSide));
       }
     });
     return updatedSide;
