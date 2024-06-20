@@ -96,7 +96,7 @@ const OrderBook = () => {
           console.log(
             "calling resynchronize as message buffer sequence is missed"
           );
-          // resynchronize();
+          resynchronize();
           return;
         }
       });
@@ -151,9 +151,6 @@ const OrderBook = () => {
   const handlePublication = (message) => {
     const data = message.data;
     console.log(data.sequence);
-    if (data.sequence % 200 === 0) {
-      return;
-    }
     if (isFecthingSnapshot.current) {
       console.log("Waiting for snapshot");
       messageBuffer.current.push(data);
