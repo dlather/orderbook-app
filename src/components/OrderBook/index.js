@@ -1,12 +1,12 @@
 import { Centrifuge } from "centrifuge";
 import { useEffect, useState, useRef } from "react";
-import { orderBookChannel, orderBookSymbol } from "../../constants";
+import { orderBookChannel } from "../../constants";
 
 const OrderBook = () => {
   const [bids, setBids] = useState([]); // desending order
   const [asks, setAsks] = useState([]); // asending order
-  const [maxAskSize, setmaxAskSize] = useState(0);
-  const [maxBidSize, setmaxBidSize] = useState(0);
+  const [maxAskSize, setmaxAskSize] = useState(0); // precomputed for ask bar
+  const [maxBidSize, setmaxBidSize] = useState(0); // precomputed for bid bar
   const [connected, setconnected] = useState(false);
   const centrifugeRef = useRef(null);
   const lastSequence = useRef(0);
@@ -16,7 +16,6 @@ const OrderBook = () => {
       debug: true,
       token:
         "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiI0MDAwMDAwMDAwIiwiZXhwIjo2NTQ4NDg3NTY5fQ.o_qBZltZdDHBH3zHPQkcRhVBQCtejIuyq8V1yj5kYq8",
-      // "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIwIiwiZXhwIjo1MjYyNjUyMDEwfQ.x_245iYDEvTTbraw1gt4jmFRFfgMJb-GJ-hsU9HuDik",
     });
     centrifugeRef.current = centri;
 
@@ -62,6 +61,7 @@ const OrderBook = () => {
     lastSequence.current = ctx.data.sequence ?? 0;
   };
 
+  // To find the max size in the array of asks / bids
   const findMaxSize = (pairs) => {
     return pairs.length > 0
       ? pairs.reduce(
@@ -96,23 +96,34 @@ const OrderBook = () => {
     }
     lastSequence.current = data.sequence;
     setBids((prevBids) => {
-      const updatedBids = mergeOrders(prevBids, data.bids, "bid");
-      setmaxBidSize(findMaxSize(updatedBids ?? []));
+      const [updatedBids, _maxBidSize] = mergeOrders(
+        prevBids,
+        data.bids,
+        "bid",
+        maxBidSize
+      );
+      setmaxBidSize(_maxBidSize);
       return updatedBids;
     });
     setAsks((prevAsks) => {
-      const updatedAsks = mergeOrders(prevAsks, data.asks, "ask");
-      setmaxAskSize(findMaxSize(updatedAsks ?? []));
+      const [updatedAsks, _maxAskSize] = mergeOrders(
+        prevAsks,
+        data.asks,
+        "ask",
+        maxAskSize
+      );
+      setmaxAskSize(_maxAskSize);
       return updatedAsks;
     });
   };
 
-  const mergeOrders = (side, updates, orderType) => {
+  const mergeOrders = (side, updates, orderType, maxQuantity) => {
     const updatedSide = [...side];
     updates.forEach(([price, quantity]) => {
       const index = updatedSide.findIndex(
         (order) => parseFloat(order[0]) === parseFloat(price)
       );
+      const updatedSizeOldQuant = index === -1 ? null : updatedSide[index][1];
       if (index !== -1) {
         if (parseFloat(quantity) === 0) {
           updatedSide.splice(index, 1);
@@ -121,14 +132,16 @@ const OrderBook = () => {
         }
       } else if (parseFloat(quantity) !== 0) {
         updatedSide.push([price, quantity]);
+        // sort only if new element is pushed
         updatedSide.sort((a, b) =>
           orderType === "bid"
             ? parseFloat(b[0]) - parseFloat(a[0])
             : parseFloat(a[0]) - parseFloat(b[0])
         );
       }
+      maxQuantity = Math.max(maxQuantity, parseFloat(quantity));
     });
-    return updatedSide;
+    return [updatedSide, maxQuantity];
   };
   return connected ? (
     <div className="overflow-x-auto">
